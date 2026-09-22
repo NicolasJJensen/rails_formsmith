@@ -122,9 +122,38 @@ You can also override the generated binding information:
 <%= form.text_field :reference, label: "Invoice number", value: nil %>
 ```
 
-`name`, `id`, `value`, `errors`, and `label` are binding options. Formsmith moves
-them into `field` and removes them from the adapter's `options` hash. Explicit
-`nil` and `false` values are preserved rather than replaced with model values.
+For field registrations, `name`, `id`, `value`, `errors`, and `label` are binding
+options. Formsmith applies their overrides when constructing `field`, then
+removes those keys from the adapter's `options` hash. For example:
+
+```ruby
+form.text_field :reference, label: "Invoice number", value: nil, class: "input"
+
+# Inside the adapter:
+field.label # => "Invoice number"
+field.value # => nil
+options     # => { class: "input" }
+```
+
+This gives binding information one authoritative location. An adapter can map
+`field.label` to a component's `caption:` argument, or format `field.value`,
+without `**options` forwarding the original key and overriding that decision.
+
+Omitting `value:` uses the model value when available. Passing `value: nil`
+explicitly clears it; `value: false` also remains false. `errors: nil` becomes
+an empty array. The component decides how to render these values.
+
+A field name does not have to be an attribute on the model:
+
+```erb
+<%= form.text_field :image_owner %>
+<%= form.text_field :image_owner, value: "Alice" %>
+```
+
+Without an `image_owner` reader, the first call receives `field.value == nil`.
+The second receives `"Alice"`. Both still get generated names, IDs, labels, and
+any validation errors for that field name. Virtual attributes with readers work
+like other model values.
 
 ### Defaults and nested forms
 
@@ -139,13 +168,109 @@ Use `defaults:` to share options within a form:
 <% end %>
 ```
 
-Options on an individual field override defaults. The merge is shallow: passing
-`data: { action: "change->field#update" }` replaces the default `data` hash.
-Defaults apply to registered helpers only.
+Defaults apply to registered helpers only. By default, merging is shallow:
+field options replace defaults with the same key. Passing
+`data: { action: "change->field#update" }` therefore replaces the default `data`
+hash entirely.
 
-Nested `fields_for` builders inherit these defaults. Pass `defaults:` to
-`fields_for` to replace them for that nested form, or `defaults: {}` to clear
-them. Rails continues to generate nested field names and IDs.
+Choose a default policy on your builder:
+
+```ruby
+class ApplicationFormBuilder < Formsmith::Builder
+  defaults_merge :deep
+
+  register :text_field, adapter: "Forms::TextFieldAdapter"
+end
+```
+
+Or override the policy for a form:
+
+```erb
+<%= form_with model: @invoice,
+              builder: ApplicationFormBuilder,
+              defaults_merge: :deep,
+              defaults: { data: { controller: "field" } } do |form| %>
+  <%= form.text_field :reference, data: { action: "change->field#update" } %>
+<% end %>
+```
+
+Here the adapter receives both `data[:controller]` and `data[:action]`.
+
+| Policy | Behavior |
+| --- | --- |
+| `:shallow` | Replace each top-level default with the supplied option. The fallback policy. |
+| `:deep` | Merge nested hashes recursively. Arrays, strings, and other values replace defaults. |
+| `:adapter` | Call the adapter's `merge_options(defaults:, options:)` method. |
+
+Both built-in policies preserve explicit `nil` and `false` overrides. Neither
+concatenates CSS classes or controller names.
+
+A registration can pin a policy with `merge:`:
+
+```ruby
+register :text_field, adapter: "Forms::TextFieldAdapter", merge: :adapter
+```
+
+Precedence is **registration `merge:` → form `defaults_merge:` → builder
+`defaults_merge` → `:shallow`**. All three configuration levels accept the same
+policies. Builder subclasses inherit the builder policy and can override it.
+
+Nested `fields_for` builders inherit the form's defaults and effective merge
+policy. Pass `defaults:` to replace the nested defaults, `defaults: {}` to clear
+them, or `defaults_merge:` to override the nested policy. Registration policies
+still take precedence. Rails continues to generate nested field names and IDs.
+
+### Adapter-controlled merging
+
+With `merge: :adapter`, Formsmith passes independent copies of the original
+defaults and caller options to `merge_options`. Nothing has been merged or
+removed yet. The method must return a Hash; missing methods or invalid results
+raise `ArgumentError`.
+
+For example, this adapter combines string classes and `data-controller` tokens
+while deep-merging other options:
+
+```ruby
+module Forms
+  class TextFieldAdapter
+    def self.merge_options(defaults:, options:)
+      merged = defaults.deep_merge(options)
+
+      if options.key?(:class)
+        merged[:class] = combine_tokens(defaults[:class], options[:class])
+      end
+
+      if options[:data].is_a?(Hash) && options[:data].key?(:controller)
+        merged[:data][:controller] = combine_tokens(
+          defaults.dig(:data, :controller), options[:data][:controller]
+        )
+      end
+
+      merged
+    end
+
+    def self.combine_tokens(default, override)
+      return nil if override.nil? || override == false
+
+      [default, override].compact.flat_map { |value| value.split }.uniq.join(" ")
+    end
+
+    private_class_method :combine_tokens
+
+    # Keep the build(field:, options:) implementation from the quick start.
+  end
+end
+```
+
+This example expects symbol keys and string token lists (or `nil`/`false` to
+clear a list). `class: "input"` plus `class: "prominent"` becomes
+`class: "input prominent"`. It deduplicates identical tokens, but does not resolve
+conflicting CSS utilities. Other component APIs can implement their own policy.
+
+After merging, Formsmith resolves the field binding and removes its binding
+keys from component options. For raw registrations, it passes the entire merged
+hash to the adapter. Adapter mutations do not change the original defaults or
+caller option hashes.
 
 ## Writing adapters
 
@@ -169,6 +294,65 @@ registration, pass `replace: true`:
 register :text_field, adapter: "Forms::CompactTextFieldAdapter", replace: true
 ```
 
+### Helpers with raw arguments
+
+The default registration mode is `arguments: :field`: the first argument is a
+field name, whether or not the model has a corresponding reader. For buttons,
+actions, or components with multiple positional arguments, use the same
+`register` method with `arguments: :raw`:
+
+```ruby
+class ApplicationFormBuilder < Formsmith::Builder
+  register :text_field, adapter: "Forms::TextFieldAdapter"
+  register :submit, adapter: "Forms::SubmitAdapter", arguments: :raw
+end
+```
+
+A raw adapter receives `arguments:` instead of `field:`:
+
+```ruby
+module Forms
+  class SubmitAdapter
+    def self.build(arguments:, options:)
+      SubmitComponent.new(text: arguments.fetch(0, "Save"), **options)
+    end
+  end
+end
+```
+
+For example, `app/components/submit_component.rb` could contain:
+
+```ruby
+class SubmitComponent < ViewComponent::Base
+  def initialize(text:, **options)
+    @text, @options = text, options
+  end
+
+  def call
+    tag.button(content.presence || @text, **@options, type: "submit")
+  end
+end
+```
+
+```erb
+<%= form.submit "Save invoice", class: "primary", name: "commit", value: "save" %>
+```
+
+The adapter receives `arguments: ["Save invoice"]` and all merged options,
+including `name` and `value`. No Field is constructed and no binding keys are
+removed. A call without positional arguments receives `arguments: []`. Blocks
+are forwarded to the returned component for rendering.
+
+Raw helpers accept any number of positional arguments. A trailing hash is
+treated as options; keyword options override duplicate keys in that hash. This
+convention also applies to field registrations, which require exactly one field
+name after extracting options.
+
+A raw adapter owns the argument semantics. The example chooses `"Save"` as its
+default text; Formsmith does not supply Rails' model-aware create/update labels.
+Likewise, registering a composite helper does not automatically bind each of
+its positional arguments to model attributes.
+
 ### Field reference
 
 The adapter receives a frozen `Formsmith::Field`:
@@ -190,7 +374,8 @@ value is `nil`, errors are empty, and the label is the humanized attribute name.
 
 ## Rails compatibility and helper differences
 
-Registered helpers accept `attribute, options = {}, &block`. Their options are
+Field registrations accept a field name and an options hash; raw registrations
+forward positional arguments to the adapter. Their options are
 interpreted by your adapter and component; registering a helper does not
 reproduce all of Rails' helper-specific rendering behavior.
 
@@ -204,10 +389,17 @@ option:
 Your adapter must handle that `options:` key. Rails' positional form,
 `form.select :country, ["AU", "NZ"]`, is not supported for registered helpers.
 
-Registering `file_field` still marks the form as multipart. Structural and
-reserved helpers cannot be registered: `fields_for`, `fields`, `model_name`,
-`object`, `object_name`, `options`, `multipart?`, `id`, `label`, `hidden_field`,
-`button`, and `submit`.
+Registering `file_field` still marks the form as multipart. Rendering helpers
+such as `label`, `hidden_field`, `button`, and `submit` may be registered. Use
+raw mode when their arguments do not follow the field-name convention. Your
+adapter and component must implement any required helper-specific behavior;
+for example, a registered hidden field may also be used for Rails-generated
+nested record identifiers.
+
+Builder infrastructure remains reserved: `fields_for`, `fields`, `model_name`,
+`object`, `object_name`, `options`, `multipart?`, `multipart=`, `id`, `field_name`,
+`field_id`, `component_defaults`, and `defaults_merge`. Replacing these would
+interfere with scope creation, binding generation, or builder state.
 
 ## Development
 

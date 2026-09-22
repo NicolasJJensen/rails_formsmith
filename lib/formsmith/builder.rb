@@ -3,10 +3,11 @@
 module Formsmith
   class Builder < ActionView::Helpers::FormBuilder
     RESERVED_HELPERS = %i[
-      fields_for fields fields model_name object object_name options
-      multipart? id label hidden_field button submit
+      fields_for fields model_name object object_name options
+      multipart? multipart= id field_name field_id component_defaults defaults_merge
     ].freeze
     OMITTED = Object.new.freeze
+    MERGE_POLICIES = %i[shallow deep adapter].freeze
     BINDING_OPTIONS = %i[name id value errors label].freeze
 
     class << self
@@ -14,12 +15,35 @@ module Formsmith
         @registry ||= superclass.respond_to?(:registry) ? superclass.registry.dup : {}
       end
 
+      def registration_options
+        @registration_options ||= {}
+      end
+
+      def defaults_merge(policy = OMITTED)
+        if policy.equal?(OMITTED)
+          return @defaults_merge if instance_variable_defined?(:@defaults_merge)
+          return superclass.defaults_merge if superclass.respond_to?(:defaults_merge)
+
+          return :shallow
+        end
+
+        validate_merge_policy!(policy)
+        @defaults_merge = policy
+      end
+
+      def validate_merge_policy!(policy)
+        unless MERGE_POLICIES.include?(policy)
+          raise ArgumentError, "defaults merge policy must be :shallow, :deep, or :adapter"
+        end
+      end
+
       def inherited(subclass)
         super
         subclass.instance_variable_set(:@registry, registry.dup)
+        subclass.instance_variable_set(:@registration_options, registration_options.dup)
       end
 
-      def register(method, adapter:, replace: false)
+      def register(method, adapter:, replace: false, arguments: :field, merge: nil)
         method = method.to_sym
         if RESERVED_HELPERS.include?(method)
           raise ArgumentError, "#{method} is a structural or reserved FormBuilder helper and cannot be registered"
@@ -28,20 +52,29 @@ module Formsmith
           raise ArgumentError, "#{method} is already registered; pass replace: true to replace its adapter"
         end
 
+        unless %i[field raw].include?(arguments)
+          raise ArgumentError, "arguments must be :field or :raw"
+        end
+        validate_merge_policy!(merge) unless merge.nil?
+
         registry[method] = adapter
+        registration_options[method] = { arguments: arguments, merge: merge }.freeze
         define_component_method(method)
       end
 
       private
 
       def define_component_method(method)
-        define_method(method) do |attribute, options = {}, &block|
-          component_field(method, attribute, options, &block)
+        define_method(method) do |*arguments, **options, &block|
+          if arguments.last.respond_to?(:to_hash)
+            options = arguments.pop.to_hash.merge(options)
+          end
+          component_field(method, arguments, options, &block)
         end
       end
     end
 
-    attr_reader :component_defaults
+    attr_reader :component_defaults, :defaults_merge
 
     def initialize(object_name, object, template, options)
       super
@@ -50,6 +83,8 @@ module Formsmith
         raise ArgumentError, "defaults must be a hash"
       end
       @component_defaults = supplied_defaults.to_hash.deep_dup.freeze
+      @defaults_merge = options.fetch(:defaults_merge) { self.class.defaults_merge }
+      self.class.validate_merge_policy!(@defaults_merge)
     end
 
     # Rails uses this method for nested attributes. Preserve this builder's
@@ -61,20 +96,49 @@ module Formsmith
       end
       fields_options = (fields_options || {}).dup
       fields_options[:defaults] = component_defaults unless fields_options.key?(:defaults)
+      fields_options[:defaults_merge] = defaults_merge unless fields_options.key?(:defaults_merge)
       super(record_name, record_object, fields_options, &block)
     end
 
     private
 
-    def component_field(helper, attribute, supplied_options, &block)
-      options = supplied_options.to_hash.deep_dup
+    def component_field(helper, arguments, supplied_options, &block)
+      registration = self.class.registration_options.fetch(helper)
+      if registration[:arguments] == :field && arguments.length != 1
+        raise ArgumentError, "#{helper} expects one field name and an options hash"
+      end
+
       self.multipart = true if helper == :file_field
       adapter = resolve_adapter(self.class.registry.fetch(helper))
-      merged_options = component_defaults.deep_dup.merge(options)
-      field = build_field(helper, attribute, merged_options)
-      component_options = merged_options.except(*BINDING_OPTIONS).deep_dup
-      component = adapter.build(field: field, options: component_options)
+      merged_options = merge_component_options(adapter, registration[:merge] || defaults_merge, supplied_options)
+      component = if registration[:arguments] == :raw
+        adapter.build(arguments: arguments, options: merged_options)
+      else
+        field = build_field(helper, arguments.first, merged_options)
+        adapter.build(field: field, options: merged_options.except(*BINDING_OPTIONS))
+      end
       @template.render(component, &block)
+    end
+
+    def merge_component_options(adapter, policy, supplied_options)
+      defaults = component_defaults.deep_dup
+      options = supplied_options.deep_dup
+      merged = case policy
+      when :shallow
+        defaults.merge(options)
+      when :deep
+        defaults.deep_merge(options)
+      when :adapter
+        unless adapter.respond_to?(:merge_options)
+          raise ArgumentError, "#{adapter} must implement merge_options(defaults:, options:) for :adapter merging"
+        end
+        adapter.merge_options(defaults: defaults, options: options)
+      end
+      unless merged.is_a?(Hash)
+        raise ArgumentError, "merge_options must return a Hash"
+      end
+
+      merged.deep_dup
     end
 
     def resolve_adapter(adapter)
